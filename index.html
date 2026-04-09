@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Finnish Vowel Space</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%;
+      background: #080808;
+      color: #f0f0f0;
+      font-family: 'Courier New', monospace;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #title {
+      position: fixed;
+      top: 1.8rem;
+      font-size: 0.65rem;
+      letter-spacing: 0.45em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.2);
+    }
+
+    /* Big vowel symbol floats behind canvas */
+    #ghost {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 22vw;
+      font-family: 'Palatino Linotype', 'Book Antiqua', Palatino, serif;
+      font-style: italic;
+      color: rgba(255,255,255,0.04);
+      pointer-events: none;
+      transition: opacity 0.12s ease;
+      opacity: 0;
+      line-height: 1;
+    }
+
+    canvas { cursor: crosshair; display: block; }
+
+    #info {
+      position: fixed;
+      bottom: 2.5rem;
+      font-size: 0.6rem;
+      letter-spacing: 0.2em;
+      color: rgba(255,255,255,0.2);
+      text-align: center;
+      min-height: 1em;
+    }
+
+    #hint {
+      position: fixed;
+      bottom: 1.2rem;
+      font-size: 0.55rem;
+      letter-spacing: 0.25em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.1);
+    }
+  </style>
+</head>
+<body>
+
+<div id="title">Finnish Vowel Space</div>
+<div id="ghost"></div>
+<canvas id="c"></canvas>
+<div id="info"></div>
+<div id="hint">hold &amp; drag to explore</div>
+
+<script>
+'use strict';
+
+// ── Vowel data ───────────────────────────────────────────────────────────────
+// Finnish 8 vowels. Formant frequencies from Suomi, Toivanen & Ylitalo (2008),
+// male speaker means. Bandwidths estimated from Finnish phonetics literature.
+//   F1, F2, F3 in Hz  |  B1, B2, B3 (bandwidths) in Hz
+const VOWELS = [
+  { id:'i',  F1: 268,  F2:2182, F3:2950,  B1: 55,  B2: 90,  B3:150 },
+  { id:'e',  F1: 411,  F2:1973, F3:2826,  B1: 70,  B2:105,  B3:155 },
+  { id:'ä',  F1: 673,  F2:1641, F3:2582,  B1:105,  B2:115,  B3:160 },
+  { id:'a',  F1: 774,  F2:1216, F3:2580,  B1:120,  B2:128,  B3:175 },
+  { id:'ö',  F1: 404,  F2:1431, F3:2028,  B1: 70,  B2:108,  B3:148 },
+  { id:'o',  F1: 474,  F2: 879, F3:2602,  B1: 80,  B2:100,  B3:152 },
+  { id:'u',  F1: 307,  F2: 750, F3:2290,  B1: 60,  B2: 82,  B3:142 },
+  { id:'y',  F1: 298,  F2:1706, F3:2038,  B1: 60,  B2:102,  B3:143 },
+];
+
+// ── IPA-style coordinate mapping ─────────────────────────────────────────────
+// X-axis: F2 decreasing → left = front vowels, right = back vowels
+// Y-axis: F1 increasing ↓ → top = close vowels, bottom = open vowels
+const F1_LO = 200, F1_HI = 870;
+const F2_LO = 650, F2_HI = 2400;
+
+const W = 660, H = 520;
+const PAD = { t: 72, r: 65, b: 68, l: 62 };
+const PW = W - PAD.l - PAD.r;
+const PH = H - PAD.t - PAD.b;
+
+const f1y = f1 => PAD.t + (f1 - F1_LO) / (F1_HI - F1_LO) * PH;
+const f2x = f2 => PAD.l + (1 - (f2 - F2_LO) / (F2_HI - F2_LO)) * PW;
+
+VOWELS.forEach(v => { v.x = f2x(v.F2); v.y = f1y(v.F1); });
+
+// ── Build edges by formant-space proximity ────────────────────────────────────
+const F1R = F1_HI - F1_LO, F2R = F2_HI - F2_LO;
+const fDist = (a, b) => Math.hypot((a.F1-b.F1)/F1R, (a.F2-b.F2)/F2R);
+const THRESH = 0.47;
+const edges = [];
+for (let i = 0; i < VOWELS.length; i++)
+  for (let j = i+1; j < VOWELS.length; j++)
+    if (fDist(VOWELS[i], VOWELS[j]) < THRESH)
+      edges.push([i, j]);
+
+// ── Audio engine ──────────────────────────────────────────────────────────────
+let ac = null, osc = null, noiseSrc = null;
+let flt = [], fGain = [], masterGain = null;
+
+function buildAudio() {
+  ac = new (window.AudioContext || window.webkitAudioContext)();
+
+  // Vocal source: sawtooth (contains all harmonics, ~-6 dB/oct natural tilt)
+  osc = ac.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.value = 128;  // F0 ≈ male speaking pitch
+
+  // Subtle F0 shimmer (±3 Hz at 5.5 Hz) for naturalness
+  const lfo = ac.createOscillator();
+  lfo.frequency.value = 5.5;
+  const lfoGain = ac.createGain();
+  lfoGain.gain.value = 3;
+  lfo.connect(lfoGain);
+  lfoGain.connect(osc.frequency);
+  lfo.start();
+
+  // White noise: ~4 % mix for breathiness
+  const bufLen = ac.sampleRate * 3;
+  const buf = ac.createBuffer(1, bufLen, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < bufLen; i++) d[i] = Math.random() * 2 - 1;
+  noiseSrc = ac.createBufferSource();
+  noiseSrc.buffer = buf;
+  noiseSrc.loop = true;
+  const noiseGain = ac.createGain();
+  noiseGain.gain.value = 0.04;
+
+  // Source bus
+  const srcBus = ac.createGain();
+  srcBus.gain.value = 1.0;
+  osc.connect(srcBus);
+  noiseSrc.connect(noiseGain);
+  noiseGain.connect(srcBus);
+
+  // Three parallel bandpass filters (F1, F2, F3)
+  // Gains compensate for sawtooth amplitude roll-off at higher harmonics
+  const mixGains = [1.0, 0.72, 0.30];
+  for (let k = 0; k < 3; k++) {
+    flt[k] = ac.createBiquadFilter();
+    flt[k].type = 'bandpass';
+    fGain[k] = ac.createGain();
+    fGain[k].gain.value = mixGains[k];
+    srcBus.connect(flt[k]);
+    flt[k].connect(fGain[k]);
+  }
+
+  masterGain = ac.createGain();
+  masterGain.gain.value = 0;
+
+  // Final gentle low-pass to remove harsh aliasing above F3
+  const lpf = ac.createBiquadFilter();
+  lpf.type = 'lowpass';
+  lpf.frequency.value = 5500;
+  lpf.Q.value = 0.5;
+
+  fGain[0].connect(masterGain);
+  fGain[1].connect(masterGain);
+  fGain[2].connect(masterGain);
+  masterGain.connect(lpf);
+  lpf.connect(ac.destination);
+
+  osc.start();
+  noiseSrc.start();
+}
+
+// Apply formant parameters with smooth time constant (tau = 40 ms)
+function applyFormants(F1, F2, F3, B1, B2, B3) {
+  if (!ac) return;
+  const t = ac.currentTime, tau = 0.04;
+  const Fs = [F1, F2, F3], Bs = [B1, B2, B3];
+  for (let k = 0; k < 3; k++) {
+    flt[k].frequency.setTargetAtTime(Fs[k], t, tau);
+    flt[k].Q.setTargetAtTime(Fs[k] / Bs[k], t, tau);
+  }
+}
+
+function soundOn() {
+  if (!ac) buildAudio();
+  if (ac.state === 'suspended') ac.resume();
+  masterGain.gain.setTargetAtTime(0.46, ac.currentTime, 0.04);
+}
+function soundOff() {
+  if (!masterGain) return;
+  masterGain.gain.setTargetAtTime(0, ac.currentTime, 0.08);
+}
+
+// ── Inverse-distance-weighted formant interpolation ───────────────────────────
+function interpolate(x, y) {
+  let sw=0, sF1=0, sF2=0, sF3=0, sB1=0, sB2=0, sB3=0;
+  for (const v of VOWELS) {
+    const d2 = (x-v.x)**2 + (y-v.y)**2;
+    const w  = d2 < 1e-4 ? 1e12 : 1 / (d2 * d2);   // 1/r^4 gives sharper nodes
+    sw  += w;
+    sF1 += v.F1*w; sF2 += v.F2*w; sF3 += v.F3*w;
+    sB1 += v.B1*w; sB2 += v.B2*w; sB3 += v.B3*w;
+  }
+  return { F1:sF1/sw, F2:sF2/sw, F3:sF3/sw, B1:sB1/sw, B2:sB2/sw, B3:sB3/sw };
+}
+
+function nearest(x, y) {
+  let best = VOWELS[0], bd = Infinity;
+  for (const v of VOWELS) {
+    const d = Math.hypot(x-v.x, y-v.y);
+    if (d < bd) { bd = d; best = v; }
+  }
+  return { v: best, d: bd };
+}
+
+// ── Canvas ────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.width = W; canvas.height = H;
+
+const NODE_R = 22;
+
+let drag = false;
+let ox = -1, oy = -1;   // origin vowel position
+let cx = -1, cy = -1;   // current cursor position
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#080808';
+  ctx.fillRect(0, 0, W, H);
+
+  // ── Subtle reference grid ──
+  ctx.strokeStyle = 'rgba(255,255,255,0.028)';
+  ctx.lineWidth = 1;
+  [300, 500, 700].forEach(f1 => {
+    const y = f1y(f1);
+    ctx.beginPath(); ctx.moveTo(PAD.l, y); ctx.lineTo(W-PAD.r, y); ctx.stroke();
+  });
+  [1000, 1500, 2000].forEach(f2 => {
+    const x = f2x(f2);
+    ctx.beginPath(); ctx.moveTo(x, PAD.t); ctx.lineTo(x, H-PAD.b); ctx.stroke();
+  });
+
+  // ── Axis annotations ──
+  ctx.font = '8px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.16)';
+  ctx.fillText('F2 ← front', PAD.l + 55, PAD.t - 22);
+  ctx.fillText('back → F2', W - PAD.r - 55, PAD.t - 22);
+
+  ctx.save();
+  ctx.translate(PAD.l - 38, H / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('close  ↑ F1  open', 0, 0);
+  ctx.restore();
+
+  // ── Edges ──
+  for (const [ai, bi] of edges) {
+    const a = VOWELS[ai], b = VOWELS[bi];
+    let alpha = 0.09;
+
+    if (drag && cx >= 0) {
+      // Project cursor onto segment, proximity highlight
+      const dx = b.x-a.x, dy = b.y-a.y;
+      const len2 = dx*dx + dy*dy;
+      const t = len2 ? Math.max(0, Math.min(1, ((cx-a.x)*dx+(cy-a.y)*dy)/len2)) : 0;
+      const px = a.x + t*dx, py = a.y + t*dy;
+      const ed = Math.hypot(cx-px, cy-py);
+      alpha = 0.09 + 0.40 * Math.max(0, 1 - ed / 90);
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.strokeStyle = `rgba(255,255,255,${alpha.toFixed(3)})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // ── Drag trace ──
+  if (drag && cx >= 0 && ox >= 0) {
+    ctx.save();
+    ctx.setLineDash([2, 8]);
+    ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(cx, cy);
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // ── Cursor glow ──
+  if (drag && cx >= 0) {
+    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, 48);
+    g.addColorStop(0, 'rgba(255,255,255,0.14)');
+    g.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.beginPath(); ctx.arc(cx, cy, 48, 0, Math.PI*2);
+    ctx.fillStyle = g; ctx.fill();
+
+    ctx.beginPath(); ctx.arc(cx, cy, 3, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.80)'; ctx.fill();
+  }
+
+  // ── Nodes ──
+  for (const v of VOWELS) {
+    const isOrigin = drag && ox >= 0 && Math.hypot(ox-v.x, oy-v.y) < NODE_R + 4;
+    const prox = (drag && cx >= 0)
+      ? Math.max(0, 1 - Math.hypot(cx-v.x, cy-v.y) / 115)
+      : 0;
+    const alpha = isOrigin ? 0.95 : 0.30 + prox * 0.50;
+
+    // Node ring
+    ctx.beginPath(); ctx.arc(v.x, v.y, NODE_R, 0, Math.PI*2);
+    ctx.strokeStyle = `rgba(255,255,255,${alpha.toFixed(3)})`;
+    ctx.lineWidth = isOrigin ? 1.5 : 1;
+    ctx.stroke();
+
+    // Soft fill on active / nearby
+    if (isOrigin || prox > 0.05) {
+      ctx.beginPath(); ctx.arc(v.x, v.y, NODE_R, 0, Math.PI*2);
+      ctx.fillStyle = `rgba(255,255,255,${(isOrigin ? 0.07 : prox*0.04).toFixed(3)})`;
+      ctx.fill();
+    }
+
+    // IPA symbol
+    ctx.font = `${isOrigin ? 'bold ' : ''}19px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = `rgba(255,255,255,${alpha.toFixed(3)})`;
+    ctx.fillText(v.id, v.x, v.y);
+
+    // Tiny formant hint (static state)
+    if (!drag) {
+      ctx.font = '7px Courier New';
+      ctx.fillStyle = 'rgba(255,255,255,0.12)';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`${v.F1}·${v.F2}`, v.x, v.y + NODE_R + 5);
+      ctx.textBaseline = 'middle';
+    }
+  }
+}
+
+// ── UI feedback ───────────────────────────────────────────────────────────────
+const ghost    = document.getElementById('ghost');
+const infoDiv  = document.getElementById('info');
+
+function updateUI(x, y) {
+  const { v, d } = nearest(x, y);
+  const fo = interpolate(x, y);
+  ghost.textContent = v.id;
+  ghost.style.opacity = Math.max(0.0, 0.9 - d / 110).toFixed(3);
+  infoDiv.textContent =
+    `F1 ${Math.round(fo.F1)} Hz  ·  F2 ${Math.round(fo.F2)} Hz  ·  F3 ${Math.round(fo.F3)} Hz`;
+}
+
+// ── Input handling ────────────────────────────────────────────────────────────
+function pos(e) {
+  const r = canvas.getBoundingClientRect();
+  const sx = W / r.width, sy = H / r.height;
+  const src = e.touches ? e.touches[0] : e;
+  return { x: (src.clientX - r.left)*sx, y: (src.clientY - r.top)*sy };
+}
+
+function onDown(e) {
+  const { x, y } = pos(e);
+  const { v, d } = nearest(x, y);
+  if (d > NODE_R * 2.8) return;
+
+  drag = true;
+  ox = v.x; oy = v.y;
+  cx = x;   cy = y;
+
+  soundOn();
+  applyFormants(v.F1, v.F2, v.F3, v.B1, v.B2, v.B3);
+  updateUI(x, y);
+  draw();
+}
+
+function onMove(e) {
+  if (!drag) return;
+  e.preventDefault();
+  const { x, y } = pos(e);
+  cx = x; cy = y;
+  const fo = interpolate(x, y);
+  applyFormants(fo.F1, fo.F2, fo.F3, fo.B1, fo.B2, fo.B3);
+  updateUI(x, y);
+  draw();
+}
+
+function onUp() {
+  if (!drag) return;
+  drag = false;
+  ox = oy = cx = cy = -1;
+  soundOff();
+  ghost.style.opacity = '0';
+  infoDiv.textContent = '';
+  draw();
+}
+
+canvas.addEventListener('mousedown',  onDown);
+canvas.addEventListener('mousemove',  onMove, { passive: false });
+canvas.addEventListener('mouseup',    onUp);
+canvas.addEventListener('mouseleave', onUp);
+canvas.addEventListener('touchstart', e => { e.preventDefault(); onDown(e); }, { passive: false });
+canvas.addEventListener('touchmove',  e => { e.preventDefault(); onMove(e); }, { passive: false });
+canvas.addEventListener('touchend',   onUp, { passive: false });
+
+draw();
+</script>
+</body>
+</html>
